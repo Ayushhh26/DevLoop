@@ -64,9 +64,17 @@ if TREE_SITTER_AVAILABLE:
             try:
                 module = importlib.import_module(module_name)
                 if hasattr(module, 'language'):
-                    LANGUAGE_MODULES[lang_name] = module.language()
-            except ImportError:
-                pass
+                    # Wrap the PyCapsule in Language() for newer tree-sitter versions
+                    raw_lang = module.language()
+                    LANGUAGE_MODULES[lang_name] = Language(raw_lang)
+            except (ImportError, TypeError) as e:
+                # If Language() wrapper fails, try direct assignment (older versions)
+                try:
+                    module = importlib.import_module(module_name)
+                    if hasattr(module, 'language'):
+                        LANGUAGE_MODULES[lang_name] = module.language()
+                except ImportError:
+                    pass
                 
     except ImportError:
         TREE_SITTER_AVAILABLE = False
