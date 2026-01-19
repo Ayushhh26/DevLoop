@@ -8,11 +8,13 @@ A local RAG (Retrieval-Augmented Generation) application that ingests GitHub rep
 
 ## ✨ Features
 
-- **🧠 Syntax-Aware Ingestion**: Reads code by function/class, not just by line number
-- **🔎 Semantic + Keyword Search**: Hybrid retrieval finds code by meaning AND exact matches
+- **🌐 Multi-Language Support**: Python, JavaScript, TypeScript, Java, C, C++, Go, Rust, Ruby, C#
+- **🧠 AST-Based Function Extraction**: Uses tree-sitter to extract **complete functions/classes** - no more truncated snippets!
+- **🔎 Hybrid Search**: Semantic (meaning) + Keyword (exact match) retrieval for best results
 - **🤖 Multi-Agent Loop**: Coder generates fixes, Critic reviews against quality rules
 - **🔒 Private & Local**: All data stays on your machine (ChromaDB + local embeddings)
 - **🔄 Switchable LLM Providers**: Groq (free) or DeepSeek (high quality)
+- **✅ Complete Function Prioritization**: Retrieved results show complete functions with metadata
 
 ## 🏗️ Architecture
 
@@ -95,7 +97,27 @@ Open `http://localhost:8501` in your browser.
 | LLM (Quality) | DeepSeek (deepseek-coder) |
 | Embeddings | HuggingFace (all-MiniLM-L6-v2) |
 | Vector DB | ChromaDB |
+| AST Parsing | tree-sitter (multi-language) |
 | UI | Streamlit |
+
+## 🌐 Supported Languages
+
+| Language | File Extensions | AST Extraction |
+|----------|-----------------|----------------|
+| Python | `.py`, `.pyw` | ✅ Full functions/classes |
+| JavaScript | `.js`, `.jsx`, `.mjs` | ✅ Full functions/classes |
+| TypeScript | `.ts`, `.tsx` | ✅ Full functions/classes |
+| Java | `.java` | ✅ Full methods/classes |
+| C | `.c`, `.h` | ✅ Full functions/structs |
+| C++ | `.cpp`, `.cc`, `.hpp` | ✅ Full functions/classes |
+| Go | `.go` | ✅ Full functions/types |
+| Rust | `.rs` | ✅ Full functions/structs |
+| Ruby | `.rb` | ✅ Full methods/classes |
+| C# | `.cs` | ✅ Full methods/classes |
+| HTML/CSS/JSON | `.html`, `.css`, `.json` | ⚡ Text chunking |
+| Markdown | `.md` | ⚡ Text chunking |
+| SQL | `.sql` | ⚡ Text chunking |
+| Shell | `.sh`, `.bash` | ⚡ Text chunking |
 
 ## 📁 Project Structure
 
@@ -104,6 +126,7 @@ repo-chat/
 ├── app.py              # Streamlit UI
 ├── agent.py            # Coder & Critic agents
 ├── ingest.py           # Repository ingestion pipeline
+├── ast_parser.py       # AST-based Python function extractor
 ├── requirements.txt    # Python dependencies
 ├── .env.example        # Environment template
 ├── .gitignore          # Git ignore rules

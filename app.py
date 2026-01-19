@@ -151,7 +151,10 @@ def retrieve_context(vectorstore: Chroma, query: str, k: int = 15) -> List[dict]
     1. Extract keywords (function names, class names) from query
     2. Perform keyword search (exact text matching)
     3. Perform semantic search (meaning-based matching)
-    4. Merge results, prioritizing keyword matches
+    4. Merge results, prioritizing:
+       - Keyword matches
+       - Complete functions (AST-extracted)
+       - Source files over test files
     5. Deduplicate by file path
     
     Returns:
@@ -182,17 +185,44 @@ def retrieve_context(vectorstore: Chroma, query: str, k: int = 15) -> List[dict]
         # Keyword matches come first (lower score = higher priority)
         all_results = keyword_results + semantic_list
         
-        # Step 4.5: Prioritize source files over test files (generic for any repo)
+        # Step 4.5: Apply scoring adjustments
         for result in all_results:
             file_path = result['metadata'].get('file_path', '').lower()
+            is_complete = result['metadata'].get('is_complete', False)
+            block_name = result['metadata'].get('block_name', '')
+            language = result['metadata'].get('language', '')
             
-            # Penalize test/spec files (they show usage, not implementation)
-            if any(pattern in file_path for pattern in ['test', 'spec', 'mock', '__test__', '_test.py']):
-                result['score'] = result['score'] * 1.5  # Increase score (worse ranking)
+            # BOOST: Complete functions (AST-extracted) are more valuable
+            if is_complete:
+                result['score'] = result['score'] * 0.7  # Strong boost for complete functions
             
-            # Boost source/lib files (they contain actual implementation)
-            elif any(pattern in file_path for pattern in ['src/', 'lib/', 'core/', 'app/', 'main']):
-                result['score'] = result['score'] * 0.8  # Decrease score (better ranking)
+            # BOOST: If function name matches a keyword in query
+            if block_name and any(kw.lower() in block_name.lower() for kw in keywords):
+                result['score'] = result['score'] * 0.5  # Very strong boost for name match
+            
+            # HEAVILY PENALIZE: Documentation files (not source code)
+            doc_patterns = ['changelog', 'readme', 'benchmark', 'docs/', 'doc/', '.md', 'license', 'contributing']
+            is_doc = any(pattern in file_path for pattern in doc_patterns)
+            
+            # PENALIZE: Test files (they show usage, not implementation)
+            test_patterns = ['test', 'spec', 'mock', '__test__', '_test.py', '_test.go', '_test.js', 'tests/']
+            is_test = any(pattern in file_path for pattern in test_patterns)
+            
+            # Apply penalties/boosts
+            if is_doc:
+                result['score'] = result['score'] * 3.0  # Heavy penalty for docs
+            elif is_test:
+                result['score'] = result['score'] * 2.0  # Penalty for test files
+            
+            # BOOST: Source code files (actual implementation)
+            source_patterns = ['src/', 'lib/', 'core/', 'app/', 'pkg/', 'internal/', 'cmd/']
+            if any(pattern in file_path for pattern in source_patterns):
+                result['score'] = result['score'] * 0.7  # Boost for source dirs
+            
+            # BOOST: Main source files at root level (common in Go, Python)
+            root_source_extensions = ['.go', '.py', '.rs', '.java', '.js', '.ts']
+            if '/' not in file_path and any(file_path.endswith(ext) for ext in root_source_extensions):
+                result['score'] = result['score'] * 0.6  # Strong boost for root-level source files
         
         # Deduplicate by content (keep first occurrence, which has better score)
         seen_content = set()
@@ -203,32 +233,46 @@ def retrieve_context(vectorstore: Chroma, query: str, k: int = 15) -> List[dict]
                 unique_results.append(result)
                 seen_content.add(content_key)
         
-        # Step 5: Deduplicate by file path (keep best match per file)
-        seen_files = set()
-        context_list = []
-        
-        # Sort by score first (lower is better)
+        # Step 5: Sort and select best results
+        # Sort by score (lower is better)
         unique_results.sort(key=lambda x: x['score'])
         
-        for result in unique_results:
+        # Prefer complete functions, but also include variety
+        complete_functions = [r for r in unique_results if r['metadata'].get('is_complete', False)]
+        partial_chunks = [r for r in unique_results if not r['metadata'].get('is_complete', False)]
+        
+        context_list = []
+        seen_files = set()
+        
+        # First, add best complete functions (up to 70% of k)
+        max_complete = int(k * 0.7)
+        for result in complete_functions:
+            if len(context_list) >= max_complete:
+                break
+            file_path = result['metadata'].get('file_path', 'unknown')
+            block_name = result['metadata'].get('block_name', '')
+            key = f"{file_path}:{block_name}"
+            
+            if key not in seen_files:
+                context_list.append(result)
+                seen_files.add(key)
+        
+        # Then, fill remaining slots with partial chunks for additional context
+        for result in partial_chunks:
+            if len(context_list) >= k:
+                break
             file_path = result['metadata'].get('file_path', 'unknown')
             
-            # Keep first occurrence of each file (best score)
             if file_path not in seen_files:
                 context_list.append(result)
                 seen_files.add(file_path)
-            
+        
+        # If still need more, add additional results
+        for result in unique_results:
             if len(context_list) >= k:
                 break
-        
-        # If we still need more results, add duplicates from different chunks
-        if len(context_list) < k:
-            for result in unique_results:
-                if len(context_list) >= k:
-                    break
-                # Check if this exact content is already included
-                if result not in context_list:
-                    context_list.append(result)
+            if result not in context_list:
+                context_list.append(result)
         
         return context_list[:k]
         
@@ -373,18 +417,36 @@ else:
                     retrieved_files = []
                     context_texts = []
                     for ctx in retrieved_context_list:
+                        block_name = ctx['metadata'].get('block_name', '')
+                        block_type = ctx['metadata'].get('block_type', '')
+                        is_complete = ctx['metadata'].get('is_complete', False)
+                        
                         retrieved_files.append({
                             'file_path': ctx['metadata'].get('file_path', 'unknown'),
                             'content': ctx['content'],
                             'language': ctx['metadata'].get('language', 'python'),
                             'score': ctx['score'],
+                            'block_name': block_name,
+                            'block_type': block_type,
+                            'is_complete': is_complete,
                         })
                         context_texts.append(ctx['content'])
                     
                     with st.expander("📄 Retrieved Code Files", expanded=True):
                         for file_info in retrieved_files:
-                            st.markdown(f"**{file_info['file_path']}** (Relevance: {1 - file_info['score']:.3f})")
-                            st.code(file_info['content'][:500] + "..." if len(file_info['content']) > 500 else file_info['content'], 
+                            # Build display header
+                            header = f"**{file_info['file_path']}**"
+                            if file_info['block_name']:
+                                header += f" → `{file_info['block_name']}`"
+                                if file_info['block_type']:
+                                    header += f" ({file_info['block_type']})"
+                            
+                            # Show completeness badge
+                            if file_info['is_complete']:
+                                header += " ✅ Complete"
+                            
+                            st.markdown(header)
+                            st.code(file_info['content'][:800] + "\n# ... (truncated)" if len(file_info['content']) > 800 else file_info['content'], 
                                    language=file_info.get('language', 'python'))
                     
                     # Run agent loop

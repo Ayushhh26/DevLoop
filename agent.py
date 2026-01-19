@@ -67,21 +67,67 @@ def get_llm(provider: Optional[str] = None) -> BaseChatModel:
         raise ValueError(f"Unsupported LLM provider: {provider}. Supported: GROQ, DEEPSEEK")
 
 
-def get_default_rules() -> List[str]:
+def get_default_rules(language: str = "python") -> List[str]:
     """
-    Get default code review rules.
-    These rules are GENERIC and work for any repository.
+    Get default code review rules based on language.
+    These rules are language-aware and appropriate for each language.
+    
+    Args:
+        language: Programming language ('python', 'go', 'javascript', 'java', etc.)
     """
-    return [
-        # Style rules
-        "All functions must have type hints",
-        "No bare 'except:' clauses - must specify exception types",
-        # Context-aware rules (generic, not repo-specific)
+    # Common rules for all languages
+    common_rules = [
         "Only use APIs, methods, and imports that appear in the retrieved code context",
         "Do not invent or hallucinate methods, properties, or classes not shown in the codebase",
         "If fixing an existing function, match the original function signature",
         "Follow the coding patterns and style shown in the retrieved context",
     ]
+    
+    # Language-specific rules
+    language_rules = {
+        'python': [
+            "All functions should have type hints for parameters and return values",
+            "No bare 'except:' clauses - must specify exception types",
+            "Use snake_case for functions and variables, PascalCase for classes",
+        ],
+        'go': [
+            "Functions should have proper error handling (return error as last value)",
+            "Use camelCase for unexported, PascalCase for exported identifiers",
+            "Concurrent access to shared data must use sync.Mutex or channels",
+            "Check for nil before dereferencing pointers",
+        ],
+        'javascript': [
+            "Use const/let instead of var",
+            "Handle promises with async/await or .catch()",
+            "Use camelCase for functions and variables, PascalCase for classes",
+        ],
+        'typescript': [
+            "All functions should have TypeScript type annotations",
+            "Use const/let instead of var",
+            "Handle promises with async/await or .catch()",
+            "Use interfaces or types for complex objects",
+        ],
+        'java': [
+            "All methods should have proper access modifiers",
+            "Handle exceptions appropriately (no empty catch blocks)",
+            "Use camelCase for methods, PascalCase for classes",
+        ],
+        'cpp': [
+            "Use RAII for resource management",
+            "Prefer smart pointers over raw pointers",
+            "Check for null before dereferencing",
+        ],
+        'rust': [
+            "Handle Result and Option types properly (no unwrap in production code)",
+            "Use snake_case for functions, PascalCase for types",
+            "Ensure proper lifetime annotations where needed",
+        ],
+    }
+    
+    # Get language-specific rules or empty list
+    lang_specific = language_rules.get(language.lower(), [])
+    
+    return common_rules + lang_specific
 
 
 def rate_limit_delay(provider: Optional[str] = None):
@@ -245,16 +291,54 @@ Your review (APPROVE or REJECT: <reason>):"""
         return {"status": "REJECT", "reason": f"Unclear review: {critique}"}
 
 
-def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = None, provider: Optional[str] = None, max_iterations: int = 3) -> Dict:
+def detect_language_from_context(context: List[str]) -> str:
+    """
+    Detect the primary programming language from code context.
+    
+    Args:
+        context: List of code snippets
+        
+    Returns:
+        Detected language name (defaults to 'python')
+    """
+    combined = " ".join(context).lower()
+    
+    # Language detection heuristics
+    indicators = {
+        'go': ['func ', 'package ', 'import "', 'go func', ':= ', 'interface{'],
+        'rust': ['fn ', 'let mut', 'impl ', '-> Result', 'pub fn', '::'],
+        'java': ['public class', 'private ', 'public void', 'System.out', '@Override'],
+        'javascript': ['const ', 'let ', '=>', 'function ', 'require(', 'module.exports'],
+        'typescript': ['interface ', ': string', ': number', 'export ', 'import {'],
+        'cpp': ['#include', 'std::', 'int main', 'nullptr', '::'],
+        'c': ['#include', 'int main', 'printf', 'malloc', 'void *'],
+        'ruby': ['def ', 'end', 'class ', 'attr_', 'require '],
+        'python': ['def ', 'import ', 'from ', 'class ', 'self.', '__init__'],
+    }
+    
+    scores = {lang: 0 for lang in indicators}
+    
+    for lang, keywords in indicators.items():
+        for keyword in keywords:
+            if keyword in combined:
+                scores[lang] += combined.count(keyword)
+    
+    # Return language with highest score, default to python
+    best_lang = max(scores, key=scores.get)
+    return best_lang if scores[best_lang] > 0 else 'python'
+
+
+def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = None, provider: Optional[str] = None, max_iterations: int = 3, language: Optional[str] = None) -> Dict:
     """
     Main agentic loop: Coder generates fix, Critic reviews, loops on rejection.
     
     Args:
         query: User's issue/question
         context: Retrieved code chunks
-        rules: Code review rules (defaults to get_default_rules())
+        rules: Code review rules (defaults to language-appropriate rules)
         provider: LLM provider ("GROQ" or "DEEPSEEK")
         max_iterations: Maximum number of iterations (default: 3)
+        language: Programming language (auto-detected if not provided)
     
     Returns:
         Dictionary with:
@@ -262,9 +346,14 @@ def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = 
         - critique: Critic's review
         - final_status: "APPROVE" or "REJECT"
         - iterations: Number of iterations
+        - language: Detected/provided language
     """
+    # Auto-detect language if not provided
+    if language is None:
+        language = detect_language_from_context(context)
+    
     if rules is None:
-        rules = get_default_rules()
+        rules = get_default_rules(language)
     
     # Get LLM instance
     llm = get_llm(provider)
@@ -300,6 +389,7 @@ def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = 
         "critique": critique,
         "final_status": final_status,
         "iterations": iterations,
+        "language": language,
     }
 
 
