@@ -70,17 +70,18 @@ def get_llm(provider: Optional[str] = None) -> BaseChatModel:
 def get_default_rules(language: str = "python") -> List[str]:
     """
     Get default code review rules based on language.
-    These rules are language-aware and appropriate for each language.
+    These rules prioritize following the codebase's actual patterns over generic best practices.
     
     Args:
         language: Programming language ('python', 'go', 'javascript', 'java', etc.)
     """
-    # Common rules for all languages
+    # Common rules for all languages (prioritize codebase patterns)
     common_rules = [
+        "CRITICAL: Follow the exact coding patterns and style shown in the retrieved code context",
         "Only use APIs, methods, and imports that appear in the retrieved code context",
         "Do not invent or hallucinate methods, properties, or classes not shown in the codebase",
-        "If fixing an existing function, match the original function signature",
-        "Follow the coding patterns and style shown in the retrieved context",
+        "If fixing an existing function, match the original function signature exactly",
+        "Match the code style (function declarations vs arrow functions, naming conventions, etc.) from the retrieved context",
     ]
     
     # Language-specific rules
@@ -97,15 +98,15 @@ def get_default_rules(language: str = "python") -> List[str]:
             "Check for nil before dereferencing pointers",
         ],
         'javascript': [
-            "Use const/let instead of var",
-            "Handle promises with async/await or .catch()",
+            "If promises are used, handle them with async/await or .catch()",
             "Use camelCase for functions and variables, PascalCase for classes",
+            "Match the function declaration style (function keyword vs arrow functions) used in the retrieved context",
         ],
         'typescript': [
             "All functions should have TypeScript type annotations",
-            "Use const/let instead of var",
-            "Handle promises with async/await or .catch()",
+            "If promises are used, handle them with async/await or .catch()",
             "Use interfaces or types for complex objects",
+            "Match the function declaration style used in the retrieved context",
         ],
         'java': [
             "All methods should have proper access modifiers",
@@ -219,11 +220,12 @@ def coder_agent(llm: BaseChatModel, query: str, context: List[str], provider: Op
     system_prompt = """You are an expert developer. Given the retrieved code context and a user issue, write a fix.
 
 CRITICAL RULES:
-1. ONLY use APIs, methods, imports, and patterns that appear in the retrieved context
-2. Do NOT invent or hallucinate methods/properties that don't exist in the codebase
-3. If fixing an existing function, MATCH the original function signature exactly
-4. Follow the coding style and patterns shown in the retrieved code
-5. If unsure about an API, use what's shown in the context, not general knowledge
+1. If a function/class is imported in the context, USE IT - do not re-implement it
+2. If a helper function exists in the codebase, USE IT - do not create a new one
+3. ONLY output the code that needs to change - not the entire file
+4. ONLY use APIs, methods, imports, and patterns that appear in the retrieved context
+5. Do NOT invent or hallucinate methods, properties, or classes that don't exist in the provided codebase
+6. If unsure about an API or pattern, use what's explicitly shown in the context, not general knowledge
 
 Output ONLY the corrected code block with no explanations. Do not include markdown code fences (```python or ```).
 Focus on fixing the specific issue mentioned by the user."""
@@ -245,14 +247,15 @@ Provide the fixed code:"""
     return call_llm_with_retry(llm, messages, provider)
 
 
-def critic_agent(llm: BaseChatModel, draft_code: str, rules: List[str], provider: Optional[str] = None) -> Dict[str, str]:
+def critic_agent(llm: BaseChatModel, draft_code: str, rules: List[str], context: Optional[List[str]] = None, provider: Optional[str] = None) -> Dict[str, str]:
     """
-    Critic Agent: Reviews code against quality rules.
+    Critic Agent: Reviews code against quality rules and codebase patterns.
     
     Args:
         llm: Language model instance
         draft_code: Code to review
         rules: List of review rules
+        context: Retrieved code context (for style comparison)
         provider: LLM provider name (for rate limiting)
     
     Returns:
@@ -260,13 +263,30 @@ def critic_agent(llm: BaseChatModel, draft_code: str, rules: List[str], provider
     """
     rules_text = "\n".join(f"- {rule}" for rule in rules)
     
+    # Include context sample for style comparison
+    context_sample = ""
+    if context:
+        # Show first 500 chars of context for style reference
+        context_preview = "\n".join(context[:2])[:500]
+        context_sample = f"""
+
+Retrieved Code Context (for style reference):
+{context_preview}
+...
+"""
+    
     system_prompt = """You are a Senior Tech Lead reviewing code. Review the proposed fix against the given rules.
+
+CRITICAL: If the retrieved code context shows a different coding style (e.g., function declarations vs arrow functions, 
+naming conventions), the proposed code should MATCH the codebase style, not generic best practices.
+
 If it violates ANY rule, output 'REJECT: <specific reason>'. 
 If it passes all rules, output 'APPROVE'.
-Be strict but fair."""
+Be strict but fair - prioritize matching codebase patterns over generic best practices."""
     
     user_prompt = f"""Review Rules:
 {rules_text}
+{context_sample}
 
 Proposed Code:
 {draft_code}
@@ -375,8 +395,8 @@ def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = 
             feedback_query = f"{query}\n\nPrevious attempt was rejected. Reason: {critique}\n\nPlease fix the issues and provide corrected code."
             draft_code = coder_agent(llm, feedback_query, context, provider)
         
-        # Critic reviews
-        review = critic_agent(llm, draft_code, rules, provider)
+        # Critic reviews - pass context for style comparison
+        review = critic_agent(llm, draft_code, rules, context=context, provider=provider)
         critique = review["reason"]
         final_status = review["status"]
         
