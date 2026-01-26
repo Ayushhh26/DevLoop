@@ -9,6 +9,7 @@ This module implements the agentic loop with:
 
 import os
 import time
+import threading
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
 
@@ -24,6 +25,9 @@ load_dotenv()
 # We'll use a simple time-based rate limiter
 _last_request_time = None
 _min_request_interval = 2.1  # Slightly more than 2 seconds to be safe (30 req/min = 2 sec/req)
+
+# LLM call timeout (2 minutes per call)
+LLM_CALL_TIMEOUT = 120  # seconds
 
 
 def get_llm(provider: Optional[str] = None) -> BaseChatModel:
@@ -155,9 +159,52 @@ def rate_limit_delay(provider: Optional[str] = None):
         _last_request_time = time.time()
 
 
+def call_llm_with_timeout(llm: BaseChatModel, messages: List, timeout: int = LLM_CALL_TIMEOUT) -> str:
+    """
+    Call LLM with timeout protection.
+    
+    Args:
+        llm: Language model instance
+        messages: List of messages to send
+        timeout: Timeout in seconds
+        
+    Returns:
+        Response content
+        
+    Raises:
+        TimeoutError: If LLM call exceeds timeout
+        Exception: If LLM call fails
+    """
+    result = [None]
+    exception = [None]
+    
+    def target():
+        try:
+            response = llm.invoke(messages)
+            result[0] = response.content.strip()
+        except Exception as e:
+            exception[0] = e
+    
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout)
+    
+    if thread.is_alive():
+        raise TimeoutError(f"LLM call timed out after {timeout} seconds")
+    
+    if exception[0]:
+        raise exception[0]
+    
+    if result[0] is None:
+        raise Exception("LLM call failed without raising an exception")
+    
+    return result[0]
+
+
 def call_llm_with_retry(llm: BaseChatModel, messages: List, provider: Optional[str] = None, max_retries: int = 3) -> str:
     """
-    Call LLM with rate limiting and retry logic for rate limit errors.
+    Call LLM with rate limiting, timeout protection, and retry logic for rate limit errors.
     
     Args:
         llm: Language model instance
@@ -169,6 +216,7 @@ def call_llm_with_retry(llm: BaseChatModel, messages: List, provider: Optional[s
         Response content
     
     Raises:
+        TimeoutError: If LLM call exceeds timeout
         Exception: If all retries fail
     """
     if provider is None:
@@ -179,10 +227,13 @@ def call_llm_with_retry(llm: BaseChatModel, messages: List, provider: Optional[s
             # Apply rate limiting
             rate_limit_delay(provider)
             
-            # Make the API call
-            response = llm.invoke(messages)
-            return response.content.strip()
+            # Make the API call with timeout
+            response = call_llm_with_timeout(llm, messages, timeout=LLM_CALL_TIMEOUT)
+            return response
         
+        except TimeoutError:
+            # Timeout errors should not be retried
+            raise
         except Exception as e:
             error_str = str(e).lower()
             

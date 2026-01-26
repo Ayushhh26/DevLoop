@@ -38,6 +38,55 @@ if "repo_name" not in st.session_state:
     st.session_state.repo_name = None
 
 
+def validate_user_query(query: str) -> tuple[bool, Optional[str]]:
+    """
+    Validate user query to prevent injection attacks.
+    
+    Args:
+        query: User query string
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if not query or not isinstance(query, str):
+        return False, "Query must be a non-empty string"
+    
+    # Check length limit (prevent extremely long queries)
+    if len(query) > 5000:
+        return False, "Query is too long (max 5000 characters)"
+    
+    # Check for potentially dangerous patterns
+    dangerous_patterns = [
+        (r'<script', "XSS script tag detected"),
+        (r'javascript:', "JavaScript protocol detected"),
+        (r'on\w+\s*=', "Event handler injection detected"),
+        (r'data:text/html', "Data URI HTML injection"),
+        (r'vbscript:', "VBScript protocol detected"),
+        (r'file://', "File protocol detected"),
+        (r'\\x[0-9a-f]{2}', "Hex encoding detected"),
+        (r'%[0-9a-f]{2}', "URL encoding detected"),
+    ]
+    
+    for pattern, description in dangerous_patterns:
+        if re.search(pattern, query, re.IGNORECASE):
+            return False, f"Query contains potentially unsafe content: {description}"
+    
+    # Check for ChromaDB/MongoDB injection patterns
+    injection_patterns = [
+        (r'\$where', "MongoDB $where injection"),
+        (r'\$ne\s*:', "MongoDB $ne operator"),
+        (r'\$gt\s*:', "MongoDB $gt operator"),
+        (r'\$lt\s*:', "MongoDB $lt operator"),
+        (r'\$regex', "MongoDB regex injection"),
+    ]
+    
+    for pattern, description in injection_patterns:
+        if re.search(pattern, query, re.IGNORECASE):
+            return False, f"Query contains potentially unsafe content: {description}"
+    
+    return True, None
+
+
 def get_repo_name_from_url(repo_url: str) -> Optional[str]:
     """Extract repository name from URL."""
     import re
@@ -65,6 +114,44 @@ def load_vectorstore(repo_name: str):
     except Exception as e:
         st.error(f"Error loading vectorstore: {e}")
         return None
+
+
+def sanitize_keyword(keyword: str) -> str:
+    """
+    Sanitize keyword to prevent injection attacks in ChromaDB queries.
+    
+    Args:
+        keyword: Raw keyword string
+        
+    Returns:
+        Sanitized keyword safe for use in ChromaDB where_document filter
+        
+    Note:
+        ChromaDB where_document uses MongoDB-style queries, so we need to be careful
+        to prevent injection attacks through special operators.
+    """
+    if not keyword or not isinstance(keyword, str):
+        return ""
+    
+    # Remove any special characters that could be used for injection
+    # Remove MongoDB operators: $, {, }, [, ], ", ', \
+    # Also remove regex special chars that could be used maliciously
+    sanitized = re.sub(r'[${}\[\]"\'\\]', '', keyword)
+    
+    # Remove MongoDB operator patterns (e.g., $where, $ne, etc.)
+    sanitized = re.sub(r'\$\w+', '', sanitized)
+    
+    # Limit length to prevent DoS
+    sanitized = sanitized[:100]
+    
+    # Remove any remaining whitespace and return
+    sanitized = sanitized.strip()
+    
+    # Final check: if empty or only special chars, return empty
+    if not sanitized or len(sanitized) < 1:
+        return ""
+    
+    return sanitized
 
 
 def extract_keywords(query: str) -> List[str]:
@@ -113,10 +200,15 @@ def keyword_search(vectorstore: Chroma, keywords: List[str], k: int = 20) -> Lis
         collection = vectorstore._collection
         
         for keyword in keywords:
+            # Sanitize keyword to prevent injection
+            sanitized_keyword = sanitize_keyword(keyword)
+            if not sanitized_keyword:
+                continue
+            
             # Use ChromaDB's where_document filter for substring matching
             try:
                 results = collection.get(
-                    where_document={"$contains": keyword},
+                    where_document={"$contains": sanitized_keyword},
                     limit=k,
                     include=["documents", "metadatas"]
                 )
@@ -311,6 +403,12 @@ with st.sidebar:
         if not repo_url:
             st.error("Please enter a GitHub repository URL")
         else:
+            # Validate URL before processing
+            is_valid, error_msg = ingest.validate_github_url(repo_url)
+            if not is_valid:
+                st.error(f"Invalid GitHub URL: {error_msg}")
+                st.stop()
+            
             with st.spinner("Ingesting repository... This may take a few minutes."):
                 try:
                     result = ingest.ingest_repo(repo_url)
@@ -325,8 +423,12 @@ with st.sidebar:
                         if st.session_state.vectorstore:
                             st.session_state.chat_history = []
                             st.rerun()
+                except TimeoutError as e:
+                    st.error(f"⏱️ Timeout Error: {str(e)}. The repository may be too large or the network connection is slow.")
+                except ValueError as e:
+                    st.error(f"Validation Error: {str(e)}")
                 except Exception as e:
-                    st.error(f"Error ingesting repository: {e}")
+                    st.error(f"Error ingesting repository: {str(e)}")
     
     # Display current repository
     if st.session_state.ingested_repo_url:
@@ -384,6 +486,16 @@ else:
     user_query = st.chat_input("Ask about your codebase or request a fix...")
     
     if user_query:
+        # Validate user query before processing
+        is_valid, error_msg = validate_user_query(user_query)
+        if not is_valid:
+            st.error(f"Invalid query: {error_msg}")
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": f"Error: {error_msg}",
+            })
+            st.stop()
+        
         # Add user message to chat
         st.session_state.chat_history.append({"role": "user", "content": user_query})
         
@@ -479,6 +591,17 @@ else:
                         "final_status": result["final_status"],
                     })
                 
+                except TimeoutError as e:
+                    error_msg = str(e)
+                    if "LLM call" in error_msg:
+                        user_msg = f"⏱️ Timeout Error: The AI model took too long to respond (exceeded 120 seconds). This may happen with complex queries or slow network connections. Please try again with a simpler query or check your network connection."
+                    else:
+                        user_msg = f"⏱️ Timeout Error: {error_msg}. The operation took too long. Please try again or use a smaller repository."
+                    st.error(user_msg)
+                    st.session_state.chat_history.append({
+                        "role": "assistant",
+                        "content": user_msg,
+                    })
                 except ValueError as e:
                     st.error(f"Configuration error: {e}")
                 except Exception as e:

@@ -8,8 +8,13 @@ Falls back to language-aware splitting for other languages.
 
 import os
 import re
+import signal
+import sys
+import subprocess
+import threading
 from pathlib import Path
 from typing import List, Tuple, Optional
+from contextlib import contextmanager
 
 import git
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -20,11 +25,80 @@ from langchain_core.documents import Document
 # Import AST parser for full function extraction (multi-language)
 from ast_parser import extract_functions, CodeBlock, LANGUAGE_EXTENSIONS, get_supported_languages
 
+# Configuration constants
+MAX_REPO_SIZE_MB = 500  # Maximum repository size in MB
+MAX_FILES_TO_PROCESS = 10000  # Maximum number of files to process
+GIT_CLONE_TIMEOUT = 300  # 5 minutes timeout for git clone
+GIT_PULL_TIMEOUT = 60  # 1 minute timeout for git pull
+MAX_FILE_SIZE_BYTES = 500000  # 500KB per file (already implemented)
+MAX_TOTAL_CHUNKS = 50000  # Maximum total chunks to prevent memory exhaustion
+MAX_TOTAL_CONTENT_MB = 100  # Maximum total content size to process (MB)
+BATCH_SIZE = 100  # Process files in batches to manage memory
+
+
+def validate_github_url(url: str) -> tuple[bool, Optional[str]]:
+    """
+    Validate that URL is a legitimate GitHub URL (prevent SSRF attacks).
+    
+    Args:
+        url: URL to validate
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if not url or not isinstance(url, str):
+        return False, "URL must be a non-empty string"
+    
+    # Check length limit
+    if len(url) > 2000:
+        return False, "URL is too long (max 2000 characters)"
+    
+    # Must be https://github.com or https://www.github.com
+    github_pattern = r'^https://(www\.)?github\.com/[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(/.*)?$'
+    
+    # Prevent SSRF: reject localhost, file://, etc.
+    dangerous_patterns = [
+        r'localhost',
+        r'127\.0\.0\.1',
+        r'0\.0\.0\.0',
+        r'file://',
+        r'ftp://',
+        r'://[^/]*\.local',
+    ]
+    
+    for pattern in dangerous_patterns:
+        if re.search(pattern, url, re.IGNORECASE):
+            return False, f"URL contains potentially unsafe pattern: {pattern}"
+    
+    if not re.match(github_pattern, url):
+        return False, "Invalid GitHub URL format. Must be https://github.com/owner/repo"
+    
+    return True, None
+
 
 def sanitize_url(url: str) -> str:
-    """Clean and sanitize a GitHub URL."""
+    """
+    Clean and sanitize a GitHub URL.
+    
+    Args:
+        url: Raw URL string
+        
+    Returns:
+        Sanitized URL
+        
+    Raises:
+        ValueError: If URL is invalid or not a GitHub URL
+    """
+    if not url or not isinstance(url, str):
+        raise ValueError("URL must be a non-empty string")
+    
+    # Check length limit (prevent extremely long URLs)
+    if len(url) > 500:
+        raise ValueError("URL is too long (max 500 characters)")
+    
     # Strip whitespace
     url = url.strip()
+    
     # Remove any invisible/special characters that might get copied
     url = ''.join(char for char in url if ord(char) < 128 or char.isalnum() or char in '/:.-_')
     
@@ -43,6 +117,11 @@ def sanitize_url(url: str) -> str:
     # Remove any double slashes (except after https:)
     url = re.sub(r'(?<!:)//+', '/', url)
     
+    # Validate it's actually a GitHub URL (prevent SSRF)
+    is_valid, error_msg = validate_github_url(url)
+    if not is_valid:
+        raise ValueError(f"Invalid GitHub URL: {error_msg}")
+    
     return url
 
 
@@ -55,14 +134,148 @@ def get_repo_name(repo_url: str) -> str:
     raise ValueError(f"Invalid repository URL format: {repo_url}")
 
 
-def read_code_files(repo_path: Path) -> List[Tuple[str, str, str]]:
+def clone_repo_with_timeout(repo_url: str, repo_path: Path, timeout: int = GIT_CLONE_TIMEOUT) -> git.Repo:
     """
-    Recursively read code files from repository.
+    Clone repository with timeout protection.
+    
+    Args:
+        repo_url: GitHub repository URL
+        repo_path: Path where to clone the repository
+        timeout: Timeout in seconds
+        
+    Returns:
+        Git Repo object
+        
+    Raises:
+        TimeoutError: If clone operation exceeds timeout
+        git.exc.GitCommandError: If git command fails
+    """
+    def clone_operation():
+        return git.Repo.clone_from(repo_url, repo_path)
+    
+    result = [None]
+    exception = [None]
+    
+    def target():
+        try:
+            result[0] = clone_operation()
+        except Exception as e:
+            exception[0] = e
+    
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout)
+    
+    if thread.is_alive():
+        # Thread is still running, timeout occurred
+        # Try to clean up the partial clone
+        if repo_path.exists():
+            import shutil
+            try:
+                shutil.rmtree(repo_path)
+            except:
+                pass
+        raise TimeoutError(f"Git clone operation timed out after {timeout} seconds")
+    
+    if exception[0]:
+        raise exception[0]
+    
+    if result[0] is None:
+        raise Exception("Git clone operation failed without raising an exception")
+    
+    return result[0]
+
+
+def pull_repo_with_timeout(repo: git.Repo, timeout: int = GIT_PULL_TIMEOUT) -> None:
+    """
+    Pull repository updates with timeout protection.
+    
+    Args:
+        repo: Git Repo object
+        timeout: Timeout in seconds
+        
+    Raises:
+        TimeoutError: If pull operation exceeds timeout
+        git.exc.GitCommandError: If git command fails
+    """
+    def pull_operation():
+        repo.remotes.origin.pull()
+    
+    result = [None]
+    exception = [None]
+    
+    def target():
+        try:
+            result[0] = pull_operation()
+        except Exception as e:
+            exception[0] = e
+    
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout)
+    
+    if thread.is_alive():
+        raise TimeoutError(f"Git pull operation timed out after {timeout} seconds")
+    
+    if exception[0]:
+        raise exception[0]
+    
+    if result[0] is None:
+        raise Exception("Git pull operation failed without raising an exception")
+
+
+def check_repo_size_estimate(repo_url: str) -> int:
+    """
+    Estimate repository size using git ls-remote (doesn't require full clone).
+    
+    Args:
+        repo_url: GitHub repository URL
+        
+    Returns:
+        Estimated size in bytes (0 if unable to determine)
+    """
+    try:
+        # Use git ls-remote to get a rough estimate
+        # This is a lightweight operation that doesn't clone
+        result = subprocess.run(
+            ['git', 'ls-remote', '--heads', '--tags', repo_url],
+            capture_output=True,
+            timeout=30,
+            text=True
+        )
+        if result.returncode == 0:
+            # Rough estimate: count refs and multiply by average size
+            # This is a heuristic - actual size may vary significantly
+            ref_count = len(result.stdout.strip().split('\n')) if result.stdout.strip() else 0
+            # Very rough estimate: assume 1-5MB per ref (this is conservative)
+            estimated_bytes = ref_count * 3 * 1024 * 1024  # 3MB per ref
+            return estimated_bytes
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, Exception):
+        # If we can't estimate, return 0 (will skip size check)
+        pass
+    return 0
+
+
+def read_code_files(repo_path: Path, max_files: int = MAX_FILES_TO_PROCESS) -> List[Tuple[str, str, str]]:
+    """
+    Recursively read code files from repository with memory limits.
     Returns list of (file_path, content, language) tuples.
     
     Supports: Python, JavaScript, TypeScript, Java, C, C++, Go, Rust, Ruby, C#
+    
+    Args:
+        repo_path: Path to repository root
+        max_files: Maximum number of files to process
+        
+    Returns:
+        List of (file_path, content, language) tuples
     """
     code_files = []
+    total_content_size = 0
+    max_total_size_bytes = MAX_TOTAL_CONTENT_MB * 1024 * 1024
+    should_stop = False  # Flag to break out of nested loops
     
     # Comprehensive extension mapping for all supported languages
     extensions = {
@@ -117,20 +330,61 @@ def read_code_files(repo_path: Path) -> List[Tuple[str, str, str]]:
     }
     
     for root, dirs, files in os.walk(repo_path):
+        # Check if we should stop (from previous iteration)
+        if should_stop:
+            break
+        
+        # Check file count limit before processing this directory
+        if len(code_files) >= max_files:
+            print(f"Warning: Reached maximum file limit ({max_files}). Stopping file processing.")
+            should_stop = True
+            break
+        
         # Skip hidden directories and common ignore patterns
         dirs[:] = [d for d in dirs if not d.startswith('.') and d not in skip_dirs]
         
         for file in files:
+            # Check if we should stop (from previous iteration)
+            if should_stop:
+                break
+            
+            # Check file count limit again inside loop
+            if len(code_files) >= max_files:
+                print(f"Warning: Reached maximum file limit ({max_files}). Stopping file processing.")
+                should_stop = True
+                break
+            
             file_path = Path(root) / file
             ext = file_path.suffix.lower()
             
             if ext in extensions:
+                
                 try:
+                    # Check file size before reading
+                    file_size = file_path.stat().st_size
+                    if file_size > MAX_FILE_SIZE_BYTES:
+                        continue  # Skip files > 500KB
+                    
                     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read()
-                        # Skip empty or very large files
-                        if not content.strip() or len(content) > 500000:  # Skip files > 500KB
+                        # Skip empty files
+                        if not content.strip():
                             continue
+                        
+                        # Check total content size limit
+                        content_size = len(content.encode('utf-8'))
+                        if total_content_size + content_size > max_total_size_bytes:
+                            print(f"Warning: Reached maximum content size limit ({MAX_TOTAL_CONTENT_MB}MB). Stopping file processing.")
+                            should_stop = True
+                            break
+                        
+                        # Check file count limit again after size check
+                        if len(code_files) >= max_files:
+                            print(f"Warning: Reached maximum file limit ({max_files}). Stopping file processing.")
+                            should_stop = True
+                            break
+                        
+                        total_content_size += content_size
                         # Get relative path from repo root
                         rel_path = file_path.relative_to(repo_path)
                         code_files.append((str(rel_path), content, extensions[ext]))
@@ -348,14 +602,23 @@ def ingest_repo(repo_url: str) -> str:
         repo_name = get_repo_name(repo_url)
         repo_path = Path("data") / repo_name
         
-        # Clone repository (or update if exists)
+        # Check repository size estimate before cloning
+        print("Checking repository size...")
+        estimated_size = check_repo_size_estimate(repo_url)
+        if estimated_size > 0:
+            estimated_size_mb = estimated_size / (1024 * 1024)
+            if estimated_size_mb > MAX_REPO_SIZE_MB:
+                return f"Error: Repository size ({estimated_size_mb:.1f}MB) exceeds maximum allowed size ({MAX_REPO_SIZE_MB}MB)"
+            print(f"Estimated repository size: {estimated_size_mb:.1f}MB")
+        
+        # Clone repository (or update if exists) with timeout
         if repo_path.exists():
             print(f"Repository {repo_name} already exists. Updating...")
             repo = git.Repo(repo_path)
-            repo.remotes.origin.pull()
+            pull_repo_with_timeout(repo, timeout=GIT_PULL_TIMEOUT)
         else:
             print(f"Cloning repository {repo_url}...")
-            repo = git.Repo.clone_from(repo_url, repo_path)
+            repo = clone_repo_with_timeout(repo_url, repo_path, timeout=GIT_CLONE_TIMEOUT)
         
         # Read code files
         print("Reading code files...")
@@ -380,34 +643,52 @@ def ingest_repo(repo_url: str) -> str:
         ast_extracted = 0
         language_stats = {}
         
-        for file_path, content, language in code_files:
-            # Track language statistics
-            language_stats[language] = language_stats.get(language, 0) + 1
+        # Process files in batches to manage memory
+        print(f"Processing {len(code_files)} files in batches of {BATCH_SIZE}...")
+        for batch_start in range(0, len(code_files), BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, len(code_files))
+            batch = code_files[batch_start:batch_end]
             
-            # Try AST-based extraction first (works for multiple languages)
-            ast_docs = extract_code_functions(content, file_path, language, repo_name)
-            if ast_docs:
-                documents.extend(ast_docs)
-                total_chunks += len(ast_docs)
-                ast_extracted += len(ast_docs)
-                continue  # Successfully extracted with AST
+            print(f"Processing batch {batch_start // BATCH_SIZE + 1} ({batch_start + 1}-{batch_end} of {len(code_files)})...")
             
-            # Fall back to regular chunking if AST extraction failed or unsupported language
-            chunks = split_code_by_language(content, language, chunk_size=1000, chunk_overlap=200)
+            for file_path, content, language in batch:
+                # Check chunk limit
+                if total_chunks >= MAX_TOTAL_CHUNKS:
+                    print(f"Warning: Reached maximum chunk limit ({MAX_TOTAL_CHUNKS}). Stopping processing.")
+                    break
+                
+                # Track language statistics
+                language_stats[language] = language_stats.get(language, 0) + 1
+                
+                # Try AST-based extraction first (works for multiple languages)
+                ast_docs = extract_code_functions(content, file_path, language, repo_name)
+                if ast_docs:
+                    documents.extend(ast_docs)
+                    total_chunks += len(ast_docs)
+                    ast_extracted += len(ast_docs)
+                    continue  # Successfully extracted with AST
+                
+                # Fall back to regular chunking if AST extraction failed or unsupported language
+                chunks = split_code_by_language(content, language, chunk_size=1000, chunk_overlap=200)
+                
+                for idx, chunk in enumerate(chunks):
+                    if total_chunks >= MAX_TOTAL_CHUNKS:
+                        break
+                    doc = Document(
+                        page_content=chunk,
+                        metadata={
+                            'file_path': file_path,
+                            'language': language,
+                            'chunk_index': idx,
+                            'source': repo_name,
+                            'is_complete': False,  # Regular chunking, may be incomplete
+                        }
+                    )
+                    documents.append(doc)
+                    total_chunks += 1
             
-            for idx, chunk in enumerate(chunks):
-                doc = Document(
-                    page_content=chunk,
-                    metadata={
-                        'file_path': file_path,
-                        'language': language,
-                        'chunk_index': idx,
-                        'source': repo_name,
-                        'is_complete': False,  # Regular chunking, may be incomplete
-                    }
-                )
-                documents.append(doc)
-                total_chunks += 1
+            if total_chunks >= MAX_TOTAL_CHUNKS:
+                break
         
         # Print statistics
         print(f"Language breakdown: {language_stats}")
@@ -431,12 +712,30 @@ def ingest_repo(repo_url: str) -> str:
         
         return f"Successfully ingested repository '{repo_name}'. Processed {len(code_files)} files into {total_chunks} chunks."
     
+    except TimeoutError as e:
+        error_msg = str(e)
+        if "clone" in error_msg.lower():
+            return f"Error: Git clone operation timed out after {GIT_CLONE_TIMEOUT} seconds. The repository may be too large or the network connection is slow. Please try again or use a smaller repository."
+        elif "pull" in error_msg.lower():
+            return f"Error: Git pull operation timed out after {GIT_PULL_TIMEOUT} seconds. Please try again or re-clone the repository."
+        else:
+            return f"Error: Operation timed out. {error_msg}"
     except git.exc.GitCommandError as e:
-        return f"Error cloning repository: {str(e)}"
+        error_str = str(e).lower()
+        if "not found" in error_str or "does not exist" in error_str:
+            return f"Error: Repository not found. Please check the URL and ensure the repository is public or you have access."
+        elif "authentication" in error_str or "permission" in error_str:
+            return f"Error: Authentication failed. Please ensure the repository is public or check your credentials."
+        else:
+            return f"Error cloning repository: {str(e)}"
     except ValueError as e:
         return f"Error: {str(e)}"
+    except MemoryError as e:
+        return f"Error: Insufficient memory to process this repository. The repository may be too large. Please try a smaller repository or increase available memory."
     except Exception as e:
-        return f"Unexpected error during ingestion: {str(e)}"
+        import traceback
+        error_type = type(e).__name__
+        return f"Unexpected error during ingestion ({error_type}): {str(e)}"
 
 
 if __name__ == "__main__":
