@@ -10,7 +10,7 @@ This module implements the agentic loop with:
 import os
 import time
 import threading
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable
 from dotenv import load_dotenv
 
 from langchain_groq import ChatGroq
@@ -399,7 +399,7 @@ def detect_language_from_context(context: List[str]) -> str:
     return best_lang if scores[best_lang] > 0 else 'python'
 
 
-def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = None, provider: Optional[str] = None, max_iterations: int = 3, language: Optional[str] = None) -> Dict:
+def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = None, provider: Optional[str] = None, max_iterations: int = 3, language: Optional[str] = None, progress_callback: Optional[Callable] = None) -> Dict:
     """
     Main agentic loop: Coder generates fix, Critic reviews, loops on rejection.
     
@@ -437,6 +437,10 @@ def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = 
     for iteration in range(max_iterations):
         iterations = iteration + 1
         
+        # Update progress: Coder agent
+        if progress_callback:
+            progress_callback("coder", iteration, max_iterations)
+        
         # Coder generates fix
         if iteration == 1:
             # First iteration: generate from original query
@@ -446,6 +450,10 @@ def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = 
             feedback_query = f"{query}\n\nPrevious attempt was rejected. Reason: {critique}\n\nPlease fix the issues and provide corrected code."
             draft_code = coder_agent(llm, feedback_query, context, provider)
         
+        # Update progress: Critic agent
+        if progress_callback:
+            progress_callback("critic", iteration, max_iterations)
+        
         # Critic reviews - pass context for style comparison
         review = critic_agent(llm, draft_code, rules, context=context, provider=provider)
         critique = review["reason"]
@@ -453,6 +461,8 @@ def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = 
         
         # If approved, break loop
         if final_status == "APPROVE":
+            if progress_callback:
+                progress_callback("complete", iteration, max_iterations, approved=True)
             break
     
     return {

@@ -409,26 +409,42 @@ with st.sidebar:
                 st.error(f"Invalid GitHub URL: {error_msg}")
                 st.stop()
             
-            with st.spinner("Ingesting repository... This may take a few minutes."):
-                try:
-                    result = ingest.ingest_repo(repo_url)
-                    st.success(result)
-                    
-                    # Update session state
-                    repo_name = get_repo_name_from_url(repo_url)
-                    if repo_name:
-                        st.session_state.repo_name = repo_name
-                        st.session_state.ingested_repo_url = repo_url
-                        st.session_state.vectorstore = load_vectorstore(repo_name)
-                        if st.session_state.vectorstore:
-                            st.session_state.chat_history = []
-                            st.rerun()
-                except TimeoutError as e:
-                    st.error(f"⏱️ Timeout Error: {str(e)}. The repository may be too large or the network connection is slow.")
-                except ValueError as e:
-                    st.error(f"Validation Error: {str(e)}")
-                except Exception as e:
-                    st.error(f"Error ingesting repository: {str(e)}")
+            # Create progress indicators
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # Create progress tracker
+            from progress_tracker import ProgressTracker
+            tracker = ProgressTracker(progress_bar, status_text)
+            
+            # Define progress callback
+            def progress_callback(stage: str, progress: float, status: str = None):
+                if stage == "error":
+                    tracker.error(status or "An error occurred")
+                elif stage == "complete":
+                    tracker.complete(status or "Complete!")
+                else:
+                    tracker.update_status(status or stage, progress)
+            
+            try:
+                result = ingest.ingest_repo(repo_url, progress_callback=progress_callback)
+                st.success(result)
+                
+                # Update session state
+                repo_name = get_repo_name_from_url(repo_url)
+                if repo_name:
+                    st.session_state.repo_name = repo_name
+                    st.session_state.ingested_repo_url = repo_url
+                    st.session_state.vectorstore = load_vectorstore(repo_name)
+                    if st.session_state.vectorstore:
+                        st.session_state.chat_history = []
+                        st.rerun()
+            except TimeoutError as e:
+                st.error(f"⏱️ Timeout Error: {str(e)}. The repository may be too large or the network connection is slow.")
+            except ValueError as e:
+                st.error(f"Validation Error: {str(e)}")
+            except Exception as e:
+                st.error(f"Error ingesting repository: {str(e)}")
     
     # Display current repository
     if st.session_state.ingested_repo_url:
@@ -515,7 +531,8 @@ else:
                         st.stop()
                     
                     # Retrieve relevant context (increased k for better retrieval)
-                    retrieved_context_list = retrieve_context(st.session_state.vectorstore, user_query, k=10)
+                    with st.spinner("🔍 Searching codebase..."):
+                        retrieved_context_list = retrieve_context(st.session_state.vectorstore, user_query, k=10)
                     
                     if not retrieved_context_list:
                         st.warning("No relevant code found. Try rephrasing your query.")
@@ -561,13 +578,32 @@ else:
                             st.code(file_info['content'][:800] + "\n# ... (truncated)" if len(file_info['content']) > 800 else file_info['content'], 
                                    language=file_info.get('language', 'python'))
                     
-                    # Run agent loop
+                    # Run agent loop with progress tracking
                     st.markdown("🤖 Running agentic loop...")
+                    
+                    # Create agent progress indicators
+                    agent_status = st.empty()
+                    agent_iteration = st.empty()
+                    
+                    # Define agent progress callback
+                    def agent_progress_callback(agent_type, iteration, max_iterations, approved=None):
+                        if agent_type == "coder":
+                            agent_status.text("💻 Coder Agent: Generating code fix...")
+                            agent_iteration.markdown(f"**Iteration {iteration}/{max_iterations}**")
+                        elif agent_type == "critic":
+                            agent_status.text("🔍 Critic Agent: Reviewing code...")
+                        elif agent_type == "complete":
+                            if approved:
+                                agent_status.success("✅ Code approved!")
+                            else:
+                                agent_status.warning(f"⚠️ Code rejected after {iteration} iteration(s)")
+                    
                     result = agent.run_agent_loop(
                         query=user_query,
                         context=context_texts,
                         provider=llm_provider,
                         max_iterations=3,
+                        progress_callback=agent_progress_callback,
                     )
                     
                     # Display draft code

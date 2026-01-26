@@ -13,7 +13,7 @@ import sys
 import subprocess
 import threading
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Callable
 from contextlib import contextmanager
 
 import git
@@ -258,7 +258,7 @@ def check_repo_size_estimate(repo_url: str) -> int:
     return 0
 
 
-def read_code_files(repo_path: Path, max_files: int = MAX_FILES_TO_PROCESS) -> List[Tuple[str, str, str]]:
+def read_code_files(repo_path: Path, max_files: int = MAX_FILES_TO_PROCESS, progress_callback: Optional[Callable] = None) -> List[Tuple[str, str, str]]:
     """
     Recursively read code files from repository with memory limits.
     Returns list of (file_path, content, language) tuples.
@@ -388,6 +388,10 @@ def read_code_files(repo_path: Path, max_files: int = MAX_FILES_TO_PROCESS) -> L
                         # Get relative path from repo root
                         rel_path = file_path.relative_to(repo_path)
                         code_files.append((str(rel_path), content, extensions[ext]))
+                        
+                        # Update progress callback if provided (every 50 files to avoid spam)
+                        if progress_callback and len(code_files) % 50 == 0:
+                            progress_callback(len(code_files), max_files, str(rel_path))
                 except Exception as e:
                     print(f"Warning: Could not read {file_path}: {e}")
                     continue
@@ -583,60 +587,83 @@ def extract_code_functions(content: str, file_path: str, language: str, repo_nam
     return documents if documents else None
 
 
-def ingest_repo(repo_url: str) -> str:
+def ingest_repo(repo_url: str, progress_callback: Optional[Callable] = None) -> str:
     """
     Ingest a GitHub repository: clone, parse code files, create embeddings, and store in ChromaDB.
     
     Args:
         repo_url: GitHub repository URL (e.g., https://github.com/user/repo)
+        progress_callback: Optional callback function for progress updates
+                          (receives stage, progress, status_message)
     
     Returns:
         Status message with ingestion count
     """
     try:
-        # Sanitize URL to handle copy-paste issues
-        repo_url = sanitize_url(repo_url)
-        print(f"Sanitized URL: {repo_url}")
+        # Helper function to update progress
+        def update_progress(stage_name: str, progress: float, status: str = None):
+            if progress_callback:
+                progress_callback(stage_name, progress, status)
+            else:
+                print(f"[{int(progress * 100)}%] {status or stage_name}")
         
-        # Get repository name
+        # Stage 1: Validating URL (0-5%)
+        update_progress("validating", 0.02, "Validating URL...")
+        repo_url = sanitize_url(repo_url)
+        
+        # Stage 2: Checking repository size (5-10%)
+        update_progress("checking_size", 0.05, "Checking repository size...")
         repo_name = get_repo_name(repo_url)
         repo_path = Path("data") / repo_name
         
-        # Check repository size estimate before cloning
-        print("Checking repository size...")
         estimated_size = check_repo_size_estimate(repo_url)
         if estimated_size > 0:
             estimated_size_mb = estimated_size / (1024 * 1024)
             if estimated_size_mb > MAX_REPO_SIZE_MB:
+                if progress_callback:
+                    progress_callback("error", 0.0, f"Repository size ({estimated_size_mb:.1f}MB) exceeds maximum ({MAX_REPO_SIZE_MB}MB)")
                 return f"Error: Repository size ({estimated_size_mb:.1f}MB) exceeds maximum allowed size ({MAX_REPO_SIZE_MB}MB)"
-            print(f"Estimated repository size: {estimated_size_mb:.1f}MB")
+            update_progress("checking_size", 0.10, f"Repository size: {estimated_size_mb:.1f}MB")
         
-        # Clone repository (or update if exists) with timeout
+        # Stage 3: Clone/Pull repository (10-30%)
         if repo_path.exists():
-            print(f"Repository {repo_name} already exists. Updating...")
+            update_progress("pulling", 0.15, f"Repository exists. Updating {repo_name}...")
             repo = git.Repo(repo_path)
             pull_repo_with_timeout(repo, timeout=GIT_PULL_TIMEOUT)
+            update_progress("pulling", 0.30, "Repository updated")
         else:
-            print(f"Cloning repository {repo_url}...")
+            update_progress("cloning", 0.15, f"Cloning repository {repo_name}...")
             repo = clone_repo_with_timeout(repo_url, repo_path, timeout=GIT_CLONE_TIMEOUT)
+            update_progress("cloning", 0.30, "Repository cloned")
         
-        # Read code files
-        print("Reading code files...")
-        code_files = read_code_files(repo_path)
+        # Stage 4: Read code files (30-50%)
+        update_progress("reading_files", 0.35, "Reading code files...")
+        def file_progress_callback(current, total, filename=None):
+            if total > 0:
+                progress = 0.35 + min((current / total) * 0.15, 0.15)
+                status = f"Reading files: {current}/{total}"
+                if filename:
+                    status += f" - {filename[:40]}..."
+                update_progress("reading_files", progress, status)
+        code_files = read_code_files(repo_path, progress_callback=file_progress_callback)
         
         if not code_files:
+            if progress_callback:
+                progress_callback("error", 0.0, "No code files found")
             return f"Error: No code files found in repository {repo_url}"
         
-        # Initialize embeddings (CPU-based, free and private)
-        print("Initializing embeddings model...")
+        update_progress("reading_files", 0.50, f"Found {len(code_files)} code files")
+        
+        # Stage 5: Initialize embeddings (50-55%)
+        update_progress("initializing", 0.50, "Initializing embeddings model...")
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2",
             model_kwargs={'device': 'cpu'}
         )
+        update_progress("initializing", 0.55, "Embeddings model ready")
         
-        # Process files and create documents
-        print("Processing and chunking code files...")
-        print(f"Supported AST languages: Python, JavaScript, TypeScript, Java, C, C++, Go, Rust, Ruby, C#")
+        # Stage 6: Process files and create documents (55-85%)
+        update_progress("processing", 0.55, f"Processing {len(code_files)} files...")
         
         documents = []
         total_chunks = 0
@@ -644,14 +671,23 @@ def ingest_repo(repo_url: str) -> str:
         language_stats = {}
         
         # Process files in batches to manage memory
-        print(f"Processing {len(code_files)} files in batches of {BATCH_SIZE}...")
-        for batch_start in range(0, len(code_files), BATCH_SIZE):
+        total_batches = (len(code_files) + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        for batch_idx, batch_start in enumerate(range(0, len(code_files), BATCH_SIZE)):
             batch_end = min(batch_start + BATCH_SIZE, len(code_files))
             batch = code_files[batch_start:batch_end]
             
-            print(f"Processing batch {batch_start // BATCH_SIZE + 1} ({batch_start + 1}-{batch_end} of {len(code_files)})...")
+            # Update progress for batch processing
+            batch_progress = 0.55 + (batch_idx / total_batches) * 0.25
+            update_progress("processing", batch_progress, 
+                          f"Processing batch {batch_idx + 1}/{total_batches} ({batch_start + 1}-{batch_end} of {len(code_files)})...")
             
-            for file_path, content, language in batch:
+            for file_idx, (file_path, content, language) in enumerate(batch):
+                # Update file-level progress
+                file_progress = batch_progress + (file_idx / len(batch)) * (0.25 / total_batches)
+                if progress_callback and file_idx % 10 == 0:  # Update every 10 files to avoid spam
+                    update_progress("processing", file_progress, 
+                                  f"Processing: {file_path[:50]}...")
                 # Check chunk limit
                 if total_chunks >= MAX_TOTAL_CHUNKS:
                     print(f"Warning: Reached maximum chunk limit ({MAX_TOTAL_CHUNKS}). Stopping processing.")
@@ -690,12 +726,16 @@ def ingest_repo(repo_url: str) -> str:
             if total_chunks >= MAX_TOTAL_CHUNKS:
                 break
         
-        # Print statistics
-        print(f"Language breakdown: {language_stats}")
-        print(f"AST-extracted {ast_extracted} complete functions/classes.")
+        # Stage 7: Creating embeddings (85-95%)
+        update_progress("creating_embeddings", 0.85, f"Creating embeddings for {total_chunks} chunks...")
         
-        # Store in ChromaDB (persistent storage)
-        print(f"Storing {total_chunks} chunks in ChromaDB...")
+        # Print statistics (for logging)
+        if not progress_callback:
+            print(f"Language breakdown: {language_stats}")
+            print(f"AST-extracted {ast_extracted} complete functions/classes.")
+        
+        # Stage 8: Store in ChromaDB (95-100%)
+        update_progress("storing", 0.95, f"Storing {total_chunks} chunks in vector database...")
         persist_directory = "./chroma_db"
         
         # Create or load vectorstore
@@ -709,6 +749,8 @@ def ingest_repo(repo_url: str) -> str:
         
         # Persist to disk
         vectorstore.persist()
+        
+        update_progress("complete", 1.0, f"Complete! Processed {len(code_files)} files into {total_chunks} chunks")
         
         return f"Successfully ingested repository '{repo_name}'. Processed {len(code_files)} files into {total_chunks} chunks."
     
