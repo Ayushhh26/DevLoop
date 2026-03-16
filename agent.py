@@ -8,6 +8,7 @@ This module implements the agentic loop with:
 """
 
 import os
+import re
 import time
 import threading
 from typing import List, Dict, Optional, Callable
@@ -91,7 +92,7 @@ def get_default_rules(language: str = "python") -> List[str]:
     # Language-specific rules
     language_rules = {
         'python': [
-            "All functions should have type hints for parameters and return values",
+            "All functions should have type hints for parameters and return values, unless the retrieved code context does not use type hints - in that case do not require them",
             "No bare 'except:' clauses - must specify exception types",
             "Use snake_case for functions and variables, PascalCase for classes",
         ],
@@ -298,7 +299,82 @@ Provide the fixed code:"""
     return call_llm_with_retry(llm, messages, provider)
 
 
-def critic_agent(llm: BaseChatModel, draft_code: str, rules: List[str], context: Optional[List[str]] = None, provider: Optional[str] = None) -> Dict[str, str]:
+def _extract_keywords_from_query(query: str) -> List[str]:
+    """
+    Extract identifiers (function names, file names, class names) from query
+    for filtering context by relevance. Used by Critic to prioritize chunks
+    that contain the target of the user's fix request.
+    """
+    keywords = []
+    # Pattern 1: "function_name function" or "the function_name function"
+    pattern1 = r'\b([a-z_][a-z0-9_]*)\s+(?:function|method|class)'
+    keywords.extend(re.findall(pattern1, query, re.IGNORECASE))
+    # Pattern 2: "function_name()" or "file_name.py"
+    pattern2 = r'\b([a-z_][a-z0-9_.]+)\s*[(.]'
+    keywords.extend(re.findall(pattern2, query, re.IGNORECASE))
+    # Pattern 3: snake_case identifiers
+    pattern3 = r'\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b'
+    keywords.extend(re.findall(pattern3, query, re.IGNORECASE))
+    # Pattern 4: CamelCase class names
+    pattern4 = r'\b([A-Z][a-zA-Z0-9]*(?:[A-Z][a-zA-Z0-9]*)+)\b'
+    keywords.extend(re.findall(pattern4, query))
+    # Remove common words and short keywords
+    stop_words = {'the', 'and', 'are', 'not', 'with', 'for', 'this', 'that', 'from', 'have'}
+    keywords = [kw for kw in keywords if kw.lower() not in stop_words and len(kw) > 3]
+    return list(set(keywords))
+
+
+def mechanical_checks(code: str, language: str) -> List[str]:
+    """
+    Regex-based checks for mechanically verifiable violations.
+    Runs before the Critic LLM call so violations are prepended as hard facts
+    that the Critic cannot rationalize away.
+
+    Args:
+        code: Generated code to check
+        language: Programming language (case-insensitive)
+
+    Returns:
+        List of violation description strings (empty if no violations)
+    """
+    if not code or not code.strip():
+        return []
+
+    language = (language or "python").lower()
+    violations: List[str] = []
+
+    # --- Python-specific checks ---
+    if language == "python":
+        # Bare except: (but not "except SomeError:" or "except (A, B):")
+        if re.search(r'except\s*:', code):
+            violations.append("Bare except: clause found - must specify exception type")
+
+    # --- JavaScript / TypeScript checks ---
+    if language in ("javascript", "typescript"):
+        if re.search(r'catch\s*\([^)]*\)\s*\{\s*\}', code, re.DOTALL):
+            violations.append("Empty catch block found")
+
+    # --- Java checks ---
+    if language == "java":
+        if re.search(r'catch\s*\([^)]*\)\s*\{\s*\}', code, re.DOTALL):
+            violations.append("Empty catch block found")
+
+    # --- Checks for all languages ---
+    if re.search(r'console\.log', code):
+        violations.append("console.log found (debug leftover)")
+
+    if re.search(r'\b(TODO|FIXME|XXX)\b', code):
+        violations.append("TODO/FIXME/XXX marker found")
+
+    for i, line in enumerate(code.splitlines(), start=1):
+        if len(line) > 200:
+            violations.append(f"Line exceeds 200 characters (line {i})")
+            break  # Report once to avoid noisy output
+
+    return violations
+
+
+def critic_agent(llm: BaseChatModel, draft_code: str, rules: List[str], context: Optional[List[str]] = None, provider: Optional[str] = None, keywords: Optional[List[str]] = None) -> Dict[str, str]:
     """
     Critic Agent: Reviews code against quality rules and codebase patterns.
     
@@ -308,17 +384,24 @@ def critic_agent(llm: BaseChatModel, draft_code: str, rules: List[str], context:
         rules: List of review rules
         context: Retrieved code context (for style comparison)
         provider: LLM provider name (for rate limiting)
+        keywords: Optional list of keywords from query to filter context by relevance
     
     Returns:
         Dictionary with 'status' ('APPROVE' or 'REJECT') and 'reason'
     """
     rules_text = "\n".join(f"- {rule}" for rule in rules)
     
-    # Include context sample for style comparison
+    # Include context sample for style comparison - filter by relevance to query
     context_sample = ""
     if context:
-        # Show first 500 chars of context for style reference
-        context_preview = "\n".join(context[:2])[:500]
+        # Filter chunks that contain query keywords (function/file names) for relevance
+        relevant_context = context
+        if keywords:
+            relevant_context = [c for c in context if any(kw in c for kw in keywords)]
+        # Fallback to full context when no keyword matches
+        relevant_context = relevant_context or context
+        # Use up to 5 chunks, 2000 chars - enough for Critic to see target function
+        context_preview = "\n\n---\n\n".join(relevant_context[:5])[:2000]
         context_sample = f"""
 
 Retrieved Code Context (for style reference):
@@ -333,6 +416,11 @@ naming conventions), the proposed code should MATCH the codebase style, not gene
 
 If it violates ANY rule, output 'REJECT: <specific reason>'. 
 If it passes all rules, output 'APPROVE'.
+
+ENFORCEMENT: If any rule is violated, you MUST output REJECT.
+Do not approve code and invent justifications for why the violation is acceptable.
+A violation is a violation regardless of context.
+
 Be strict but fair - prioritize matching codebase patterns over generic best practices."""
     
     user_prompt = f"""Review Rules:
@@ -433,6 +521,7 @@ def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = 
     critique = ""
     final_status = "REJECT"
     iterations = 0
+    query_keywords = _extract_keywords_from_query(query)
     
     for iteration in range(max_iterations):
         iterations = iteration + 1
@@ -450,12 +539,17 @@ def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = 
             feedback_query = f"{query}\n\nPrevious attempt was rejected. Reason: {critique}\n\nPlease fix the issues and provide corrected code."
             draft_code = coder_agent(llm, feedback_query, context, provider)
         
+        # Run mechanical checks on generated code before LLM critique
+        violations = mechanical_checks(draft_code, language)
+        violation_rules = [f"MUST REJECT - {v}" for v in violations] if violations else []
+        effective_rules = violation_rules + rules
+
         # Update progress: Critic agent
         if progress_callback:
             progress_callback("critic", iteration, max_iterations)
         
-        # Critic reviews - pass context for style comparison
-        review = critic_agent(llm, draft_code, rules, context=context, provider=provider)
+        # Critic reviews - pass context and keywords for relevance-filtered style comparison
+        review = critic_agent(llm, draft_code, effective_rules, context=context, provider=provider, keywords=query_keywords)
         critique = review["reason"]
         final_status = review["status"]
         
