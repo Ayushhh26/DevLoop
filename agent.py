@@ -442,7 +442,7 @@ def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = 
             progress_callback("coder", iteration, max_iterations)
         
         # Coder generates fix
-        if iteration == 1:
+        if iteration == 0:
             # First iteration: generate from original query
             draft_code = coder_agent(llm, query, context, provider)
         else:
