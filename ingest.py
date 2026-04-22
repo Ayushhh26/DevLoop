@@ -6,16 +6,20 @@ Uses AST-based extraction for Python to get complete function bodies.
 Falls back to language-aware splitting for other languages.
 """
 
+import json
 import os
+import random
 import re
 import signal
 import sys
 import subprocess
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional, Callable
 from contextlib import contextmanager
 
+import chromadb
 import git
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -24,6 +28,8 @@ from langchain_core.documents import Document
 
 # Import AST parser for full function extraction (multi-language)
 from ast_parser import extract_functions, CodeBlock, LANGUAGE_EXTENSIONS, get_supported_languages
+
+from agent import get_llm, call_llm_with_retry, UNIVERSAL_RULES
 
 # Configuration constants
 MAX_REPO_SIZE_MB = 500  # Maximum repository size in MB
@@ -34,6 +40,8 @@ MAX_FILE_SIZE_BYTES = 500000  # 500KB per file (already implemented)
 MAX_TOTAL_CHUNKS = 50000  # Maximum total chunks to prevent memory exhaustion
 MAX_TOTAL_CONTENT_MB = 100  # Maximum total content size to process (MB)
 BATCH_SIZE = 100  # Process files in batches to manage memory
+# AST-extracted functions larger than this are split into multiple embedded chunks
+AST_MAX_CHUNK_CHARS = 7000
 
 
 def validate_github_url(url: str) -> tuple[bool, Optional[str]]:
@@ -221,9 +229,6 @@ def pull_repo_with_timeout(repo: git.Repo, timeout: int = GIT_PULL_TIMEOUT) -> N
     
     if exception[0]:
         raise exception[0]
-    
-    if result[0] is None:
-        raise Exception("Git pull operation failed without raising an exception")
 
 
 def check_repo_size_estimate(repo_url: str) -> int:
@@ -441,7 +446,7 @@ def split_code_by_language(text: str, language: str, chunk_size: int = 1000, chu
     return splitter.split_text(text)
 
 
-def extract_code_functions(content: str, file_path: str, language: str, repo_name: str, max_chunk_size: int = 2000) -> Optional[List[Document]]:
+def extract_code_functions(content: str, file_path: str, language: str, repo_name: str, max_chunk_size: int = AST_MAX_CHUNK_CHARS) -> Optional[List[Document]]:
     """
     Extract complete functions/classes from source code using AST.
     
@@ -458,7 +463,7 @@ def extract_code_functions(content: str, file_path: str, language: str, repo_nam
         file_path: Path to the file (for metadata)
         language: Programming language
         repo_name: Repository name (for metadata)
-        max_chunk_size: Maximum size before splitting a function
+        max_chunk_size: Maximum character length before splitting a function (default AST_MAX_CHUNK_CHARS)
         
     Returns:
         List of Document objects with full function metadata, or None if extraction fails
@@ -587,6 +592,103 @@ def extract_code_functions(content: str, file_path: str, language: str, repo_nam
     return documents if documents else None
 
 
+def sample_chunks_stratified(documents: List[Document], max_chunks: int = 20) -> List[str]:
+    """
+    Select a diverse, representative sample of code chunks for rule inference.
+    Groups by top-level directory and prefers complete (AST-extracted) chunks.
+    """
+    code_languages = {
+        "python", "javascript", "typescript", "java", "c", "cpp", "go", "rust", "ruby", "c_sharp",
+    }
+    code_docs = [
+        d for d in documents if (d.metadata.get("language") or "").lower() in code_languages
+    ]
+    if code_docs:
+        documents = code_docs
+
+    rng = random.Random(len(documents))
+
+    groups: dict[str, List[Document]] = {}
+    for doc in documents:
+        fp = doc.metadata.get("file_path", "")
+        parts = fp.split("/")
+        group_key = "/".join(parts[:2]) if len(parts) > 1 else parts[0]
+        groups.setdefault(group_key, []).append(doc)
+
+    selected: List[str] = []
+    leftover_complete: List[str] = []
+
+    for group_key, docs in groups.items():
+        complete = [d for d in docs if d.metadata.get("is_complete")]
+        incomplete = [d for d in docs if not d.metadata.get("is_complete")]
+        pool = complete or incomplete
+        rng.shuffle(pool)
+        picked = pool[:3]
+        selected.extend(d.page_content for d in picked)
+        leftover_complete.extend(
+            d.page_content for d in complete if d not in picked
+        )
+
+    if len(selected) < max_chunks and leftover_complete:
+        rng.shuffle(leftover_complete)
+        selected.extend(leftover_complete[: max_chunks - len(selected)])
+
+    return selected[:max_chunks]
+
+
+def infer_rules_from_codebase(
+    sample_chunks: List[str], language: str, provider: Optional[str] = None
+) -> List[str]:
+    """
+    Use an LLM to observe coding patterns in sampled chunks and produce
+    a list of repo-specific rules. Returns [] on any failure.
+    """
+    try:
+        llm = get_llm(provider)
+        combined_chunks = "\n\n---\n\n".join(sample_chunks)
+
+        system_prompt = (
+            "You are a code analysis tool. Your job is to observe coding patterns\n"
+            "in a codebase and describe only what you actually see.\n\n"
+            "Rules:\n"
+            "- Describe patterns present in the samples, not general best practices\n"
+            "- If you do not see a pattern clearly, do not include a rule for it\n"
+            '- Each rule must be falsifiable: "functions do not use type hints" not "use good naming"\n'
+            "- Do not restate rules about matching existing context or avoiding hallucinated APIs\n"
+            "  -- those are already enforced separately\n"
+            "- Output ONLY a JSON array of strings, no preamble, no markdown fences\n\n"
+            "Example output:\n"
+            '["Functions do not use type hints", "Error handling uses specific exception types", '
+            '"All functions have docstrings"]'
+        )
+
+        user_prompt = (
+            f"Language: {language}\n\n"
+            f"Code samples from the repository:\n{combined_chunks}\n\n"
+            "Observe the patterns in these samples and output a JSON array of rules\n"
+            "that describe what THIS codebase actually does.\n"
+            "Do not output rules for patterns you do not see in the samples.\n"
+            "Output only the JSON array."
+        )
+
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ]
+
+        response = call_llm_with_retry(llm, messages, provider)
+        response = response.strip()
+        response = re.sub(r'```json?\s*|\s*```', '', response).strip()
+        result = json.loads(response)
+        if isinstance(result, list):
+            return [r for r in result if isinstance(r, str)]
+        return []
+    except Exception:
+        return []
+
+
 def ingest_repo(repo_url: str, progress_callback: Optional[Callable] = None) -> str:
     """
     Ingest a GitHub repository: clone, parse code files, create embeddings, and store in ChromaDB.
@@ -653,7 +755,6 @@ def ingest_repo(repo_url: str, progress_callback: Optional[Callable] = None) -> 
             return f"Error: No code files found in repository {repo_url}"
         
         update_progress("reading_files", 0.50, f"Found {len(code_files)} code files")
-        
         # Stage 5: Initialize embeddings (50-55%)
         update_progress("initializing", 0.50, "Initializing embeddings model...")
         embeddings = HuggingFaceEmbeddings(
@@ -697,7 +798,9 @@ def ingest_repo(repo_url: str, progress_callback: Optional[Callable] = None) -> 
                 language_stats[language] = language_stats.get(language, 0) + 1
                 
                 # Try AST-based extraction first (works for multiple languages)
-                ast_docs = extract_code_functions(content, file_path, language, repo_name)
+                ast_docs = extract_code_functions(
+                    content, file_path, language, repo_name, max_chunk_size=AST_MAX_CHUNK_CHARS
+                )
                 if ast_docs:
                     documents.extend(ast_docs)
                     total_chunks += len(ast_docs)
@@ -726,6 +829,8 @@ def ingest_repo(repo_url: str, progress_callback: Optional[Callable] = None) -> 
             if total_chunks >= MAX_TOTAL_CHUNKS:
                 break
         
+        dominant_language = max(language_stats, key=language_stats.get) if language_stats else "python"
+
         # Stage 7: Creating embeddings (85-95%)
         update_progress("creating_embeddings", 0.85, f"Creating embeddings for {total_chunks} chunks...")
         
@@ -737,8 +842,15 @@ def ingest_repo(repo_url: str, progress_callback: Optional[Callable] = None) -> 
         # Stage 8: Store in ChromaDB (95-100%)
         update_progress("storing", 0.95, f"Storing {total_chunks} chunks in vector database...")
         persist_directory = "./chroma_db"
-        
-        # Create or load vectorstore
+
+        # Drop existing collection so re-ingest does not duplicate embeddings
+        chroma_client = chromadb.PersistentClient(path=persist_directory)
+        try:
+            chroma_client.delete_collection(repo_name)
+        except Exception:
+            pass
+
+        # Create vectorstore (fresh collection)
         # Use repo_name as collection name to allow multiple repos
         vectorstore = Chroma.from_documents(
             documents=documents,
@@ -749,6 +861,22 @@ def ingest_repo(repo_url: str, progress_callback: Optional[Callable] = None) -> 
         
         # Persist to disk
         vectorstore.persist()
+
+        update_progress("inferring_rules", 0.97, "Inferring codebase rules...")
+        try:
+            sample_chunks = sample_chunks_stratified(documents, max_chunks=20)
+            inferred = infer_rules_from_codebase(sample_chunks, dominant_language, provider=None)
+        except Exception:
+            inferred = []
+
+        rules_data = {
+            "language": dominant_language,
+            "universal": UNIVERSAL_RULES,
+            "inferred": inferred,
+            "ingested_at": datetime.now().isoformat(),
+        }
+        rules_path = Path(f"./chroma_db/{repo_name}_rules.json")
+        rules_path.write_text(json.dumps(rules_data, indent=2))
         
         update_progress("complete", 1.0, f"Complete! Processed {len(code_files)} files into {total_chunks} chunks")
         

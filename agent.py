@@ -7,10 +7,12 @@ This module implements the agentic loop with:
 - Main loop: Orchestrates interaction with rejection feedback
 """
 
+import json
 import os
 import re
 import time
 import threading
+from pathlib import Path
 from typing import List, Dict, Optional, Callable
 from dotenv import load_dotenv
 
@@ -72,24 +74,24 @@ def get_llm(provider: Optional[str] = None) -> BaseChatModel:
         raise ValueError(f"Unsupported LLM provider: {provider}. Supported: GROQ, DEEPSEEK")
 
 
+UNIVERSAL_RULES = [
+    "CRITICAL: Follow the exact coding patterns and style shown in the retrieved code context",
+    "Only use APIs, methods, and imports that appear in the retrieved code context",
+    "Do not invent or hallucinate methods, properties, or classes not shown in the codebase",
+    "If fixing an existing function, match the original function signature exactly",
+    "Match the code style (function declarations vs arrow functions, naming conventions, etc.) from the retrieved context",
+]
+
+
 def get_default_rules(language: str = "python") -> List[str]:
     """
     Get default code review rules based on language.
     These rules prioritize following the codebase's actual patterns over generic best practices.
+    Used as fallback when inferred rules are not available.
     
     Args:
         language: Programming language ('python', 'go', 'javascript', 'java', etc.)
     """
-    # Common rules for all languages (prioritize codebase patterns)
-    common_rules = [
-        "CRITICAL: Follow the exact coding patterns and style shown in the retrieved code context",
-        "Only use APIs, methods, and imports that appear in the retrieved code context",
-        "Do not invent or hallucinate methods, properties, or classes not shown in the codebase",
-        "If fixing an existing function, match the original function signature exactly",
-        "Match the code style (function declarations vs arrow functions, naming conventions, etc.) from the retrieved context",
-    ]
-    
-    # Language-specific rules
     language_rules = {
         'python': [
             "All functions should have type hints for parameters and return values, unless the retrieved code context does not use type hints - in that case do not require them",
@@ -130,10 +132,28 @@ def get_default_rules(language: str = "python") -> List[str]:
         ],
     }
     
-    # Get language-specific rules or empty list
     lang_specific = language_rules.get(language.lower(), [])
-    
-    return common_rules + lang_specific
+    return list(UNIVERSAL_RULES) + lang_specific
+
+
+def load_rules_for_repo(repo_name: Optional[str], language: str) -> List[str]:
+    """
+    Load inferred rules for a repo if available.
+    Falls back to get_default_rules() if repo_name is None, JSON doesn't exist,
+    JSON is malformed, or inferred list is empty.
+    """
+    if repo_name:
+        rules_path = Path(f"./chroma_db/{repo_name}_rules.json")
+        if rules_path.exists():
+            try:
+                data = json.loads(rules_path.read_text())
+                universal = data.get("universal", UNIVERSAL_RULES)
+                inferred = data.get("inferred", [])
+                if inferred:
+                    return universal + inferred
+            except Exception:
+                pass
+    return get_default_rules(language)
 
 
 def rate_limit_delay(provider: Optional[str] = None):
@@ -278,6 +298,10 @@ CRITICAL RULES:
 4. ONLY use APIs, methods, imports, and patterns that appear in the retrieved context
 5. Do NOT invent or hallucinate methods, properties, or classes that don't exist in the provided codebase
 6. If unsure about an API or pattern, use what's explicitly shown in the context, not general knowledge
+7. If the fix involves an ENTIRE function, output the COMPLETE function body - do not truncate or summarize parts of it
+8. Never omit sections of a function with comments like "rest of code" or "..." - output every line
+9. If the retrieved code already satisfies the user's request (e.g. already uses specific exception types, already has the fix), output exactly this single line with no other text or code fences: NO_CHANGE_NEEDED: <brief reason>
+Do not modify working code or append extra blocks just to produce output.
 
 Output ONLY the corrected code block with no explanations. Do not include markdown code fences (```python or ```).
 Focus on fixing the specific issue mentioned by the user."""
@@ -324,6 +348,15 @@ def _extract_keywords_from_query(query: str) -> List[str]:
     return list(set(keywords))
 
 
+def _strip_optional_code_fence(text: str) -> str:
+    """Remove a single leading/trailing markdown code fence if present."""
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```\w*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    return t.strip()
+
+
 def mechanical_checks(code: str, language: str) -> List[str]:
     """
     Regex-based checks for mechanically verifiable violations.
@@ -346,8 +379,15 @@ def mechanical_checks(code: str, language: str) -> List[str]:
     # --- Python-specific checks ---
     if language == "python":
         # Bare except: (but not "except SomeError:" or "except (A, B):")
-        if re.search(r'except\s*:', code):
+        if re.search(r"except\s*:", code):
             violations.append("Bare except: clause found - must specify exception type")
+        # Broad except Exception (prefer concrete types)
+        if re.search(r"except\s+Exception\s*:", code) or re.search(
+            r"except\s+Exception\s+as\s+\w+\s*:", code
+        ):
+            violations.append(
+                "Uses 'except Exception' - use specific exception types instead"
+            )
 
     # --- JavaScript / TypeScript checks ---
     if language in ("javascript", "typescript"):
@@ -413,6 +453,11 @@ Retrieved Code Context (for style reference):
 
 CRITICAL: If the retrieved code context shows a different coding style (e.g., function declarations vs arrow functions, 
 naming conventions), the proposed code should MATCH the codebase style, not generic best practices.
+
+COMPLETENESS CHECK: If the retrieved code context contains the original version of the function
+being fixed, verify that the proposed code preserves ALL logic, test cases, and branches from
+the original. If the proposed code is missing sections that exist in the original, REJECT with
+"Incomplete: missing [description of what was dropped]".
 
 If it violates ANY rule, output 'REJECT: <specific reason>'. 
 If it passes all rules, output 'APPROVE'.
@@ -487,7 +532,7 @@ def detect_language_from_context(context: List[str]) -> str:
     return best_lang if scores[best_lang] > 0 else 'python'
 
 
-def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = None, provider: Optional[str] = None, max_iterations: int = 3, language: Optional[str] = None, progress_callback: Optional[Callable] = None) -> Dict:
+def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = None, provider: Optional[str] = None, max_iterations: int = 3, language: Optional[str] = None, progress_callback: Optional[Callable] = None, repo_name: Optional[str] = None) -> Dict:
     """
     Main agentic loop: Coder generates fix, Critic reviews, loops on rejection.
     
@@ -512,7 +557,7 @@ def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = 
         language = detect_language_from_context(context)
     
     if rules is None:
-        rules = get_default_rules(language)
+        rules = load_rules_for_repo(repo_name, language)
     
     # Get LLM instance
     llm = get_llm(provider)
@@ -538,7 +583,24 @@ def run_agent_loop(query: str, context: List[str], rules: Optional[List[str]] = 
             # Subsequent iterations: incorporate critique feedback
             feedback_query = f"{query}\n\nPrevious attempt was rejected. Reason: {critique}\n\nPlease fix the issues and provide corrected code."
             draft_code = coder_agent(llm, feedback_query, context, provider)
-        
+
+        normalized = _strip_optional_code_fence(draft_code)
+        if normalized.upper().startswith("NO_CHANGE_NEEDED"):
+            critique_msg = "No changes required - code already satisfies the request"
+            if ":" in normalized:
+                tail = normalized.split(":", 1)[1].strip()
+                if tail:
+                    critique_msg = tail
+            if progress_callback:
+                progress_callback("complete", iteration, max_iterations, approved=True)
+            return {
+                "draft_code": normalized,
+                "critique": critique_msg,
+                "final_status": "APPROVE",
+                "iterations": iterations,
+                "language": language,
+            }
+
         # Run mechanical checks on generated code before LLM critique
         violations = mechanical_checks(draft_code, language)
         violation_rules = [f"MUST REJECT - {v}" for v in violations] if violations else []

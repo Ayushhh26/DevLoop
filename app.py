@@ -235,6 +235,49 @@ def keyword_search(vectorstore: Chroma, keywords: List[str], k: int = 20) -> Lis
     return keyword_results
 
 
+def merge_split_ast_chunks(results: List[dict]) -> List[dict]:
+    """
+    Merge rows that are split parts (chunk_part 1..n) of the same AST block
+    (same file_path + block_name) into a single context item.
+    """
+    from collections import defaultdict
+
+    with_parts: dict[tuple[str, str], list] = defaultdict(list)
+    rest: List[dict] = []
+    for r in results:
+        meta = r.get("metadata") or {}
+        cp = meta.get("chunk_part")
+        fp = meta.get("file_path") or ""
+        bn = meta.get("block_name") or ""
+        if cp is not None and fp and bn:
+            with_parts[(fp, bn)].append(r)
+        else:
+            rest.append(r)
+
+    merged: List[dict] = []
+    for _key, parts in with_parts.items():
+        by_cp: dict[int, dict] = {}
+        for p in parts:
+            cp = int(p["metadata"].get("chunk_part", 0))
+            if cp not in by_cp or p["score"] < by_cp[cp]["score"]:
+                by_cp[cp] = p
+        ordered = [by_cp[k] for k in sorted(by_cp)]
+        combined = "".join(p["content"] for p in ordered)
+        meta = dict(ordered[0]["metadata"])
+        if len(ordered) > 1:
+            meta["is_complete"] = True
+        merged.append(
+            {
+                "content": combined,
+                "metadata": meta,
+                "score": min(p["score"] for p in ordered),
+                "match_type": ordered[0].get("match_type", "semantic"),
+            }
+        )
+
+    return rest + merged
+
+
 def retrieve_context(vectorstore: Chroma, query: str, k: int = 15) -> List[dict]:
     """
     HYBRID SEARCH: Combines semantic search with keyword-based search.
@@ -324,9 +367,11 @@ def retrieve_context(vectorstore: Chroma, query: str, k: int = 15) -> List[dict]
             if content_key not in seen_content:
                 unique_results.append(result)
                 seen_content.add(content_key)
-        
-        # Step 5: Sort and select best results
-        # Sort by score (lower is better)
+
+        # Reassemble split AST parts (chunk_part) before ranking / slot selection
+        unique_results = merge_split_ast_chunks(unique_results)
+
+        # Step 5: Sort and select best results (lower score is better)
         unique_results.sort(key=lambda x: x['score'])
         
         # Prefer complete functions, but also include variety
@@ -354,10 +399,12 @@ def retrieve_context(vectorstore: Chroma, query: str, k: int = 15) -> List[dict]
             if len(context_list) >= k:
                 break
             file_path = result['metadata'].get('file_path', 'unknown')
-            
-            if file_path not in seen_files:
+            block_name = result['metadata'].get('block_name', '')
+            block_key = f"{file_path}:{block_name}"
+
+            if block_key not in seen_files:
                 context_list.append(result)
-                seen_files.add(file_path)
+                seen_files.add(block_key)
         
         # If still need more, add additional results
         for result in unique_results:
@@ -604,6 +651,7 @@ else:
                         provider=llm_provider,
                         max_iterations=3,
                         progress_callback=agent_progress_callback,
+                        repo_name=st.session_state.repo_name,
                     )
                     
                     # Display draft code
